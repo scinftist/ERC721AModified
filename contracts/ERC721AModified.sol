@@ -3,8 +3,155 @@
 // Creator: Chiru Labs
 
 pragma solidity ^0.8.4;
+// import "OpenZeppelin/openzeppelin-contracts@4.8.0/contracts/utils/Checkpoints.sol";
+// import "./Checkpoints.sol";
 
 import "./IERC721A.sol";
+
+library Checkpoints {
+    struct Trace160 {
+        Checkpoint160[] _checkpoints;
+    }
+
+    struct Checkpoint160 {
+        uint96 _key;
+        uint160 _value;
+    }
+
+    /**
+     * @dev Pushes a (`key`, `value`) pair into a Trace160 so that it is stored as the checkpoint.
+     *
+     * Returns previous value and new value.
+     */
+    function push(
+        Trace160 storage self,
+        uint96 key,
+        uint160 value
+    ) internal returns (uint160, uint160) {
+        return _insert(self._checkpoints, key, value);
+    }
+
+    /**
+     * @dev Returns the value in the oldest checkpoint with key greater or equal than the search key, or zero if there is none.
+     */
+    function lowerLookup(Trace160 storage self, uint96 key)
+        internal
+        view
+        returns (uint160)
+    {
+        uint256 len = self._checkpoints.length;
+        uint256 pos = _lowerBinaryLookup(self._checkpoints, key, 0, len);
+        return pos == len ? 0 : _unsafeAccess(self._checkpoints, pos)._value;
+    }
+
+    /**
+     * @dev Returns the value in the most recent checkpoint, or zero if there are no checkpoints.
+     */
+    function latest(Trace160 storage self) internal view returns (uint160) {
+        uint256 pos = self._checkpoints.length;
+        return pos == 0 ? 0 : _unsafeAccess(self._checkpoints, pos - 1)._value;
+    }
+
+    /**
+     * @dev Returns whether there is a checkpoint in the structure (i.e. it is not empty), and if so the key and value
+     * in the most recent checkpoint.
+     */
+    function latestCheckpoint(Trace160 storage self)
+        internal
+        view
+        returns (
+            bool exists,
+            uint96 _key,
+            uint160 _value
+        )
+    {
+        uint256 pos = self._checkpoints.length;
+        if (pos == 0) {
+            return (false, 0, 0);
+        } else {
+            Checkpoint160 memory ckpt = _unsafeAccess(
+                self._checkpoints,
+                pos - 1
+            );
+            return (true, ckpt._key, ckpt._value);
+        }
+    }
+
+    /**
+     * @dev Returns the number of checkpoint.
+     */
+    function length(Trace160 storage self) internal view returns (uint256) {
+        return self._checkpoints.length;
+    }
+
+    /**
+     * @dev Pushes a (`key`, `value`) pair into an ordered list of checkpoints, either by inserting a new checkpoint,
+     * or by updating the last one.
+     */
+    function _insert(
+        Checkpoint160[] storage self,
+        uint96 key,
+        uint160 value
+    ) private returns (uint160, uint160) {
+        uint256 pos = self.length;
+
+        if (pos > 0) {
+            // Copying to memory is important here.
+            Checkpoint160 memory last = _unsafeAccess(self, pos - 1);
+
+            // Checkpoint keys must be non-decreasing.
+            require(last._key <= key, "Checkpoint: decreasing keys");
+
+            // Update or push new checkpoint
+            if (last._key == key) {
+                _unsafeAccess(self, pos - 1)._value = value;
+            } else {
+                self.push(Checkpoint160({_key: key, _value: value}));
+            }
+            return (last._value, value);
+        } else {
+            self.push(Checkpoint160({_key: key, _value: value}));
+            return (0, value);
+        }
+    }
+
+    /**
+     * @dev Return the index of the oldest checkpoint whose key is greater or equal than the search key, or `high` if there is none.
+     * `low` and `high` define a section where to do the search, with inclusive `low` and exclusive `high`.
+     *
+     * WARNING: `high` should not be greater than the array's length.
+     */
+    function _lowerBinaryLookup(
+        Checkpoint160[] storage self,
+        uint96 key,
+        uint256 low,
+        uint256 high
+    ) private view returns (uint256) {
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (_unsafeAccess(self, mid)._key < key) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        return high;
+    }
+
+    /**
+     * @dev Access an element of the array without performing bounds check. The position is assumed to be within bounds.
+     */
+    function _unsafeAccess(Checkpoint160[] storage self, uint256 pos)
+        private
+        pure
+        returns (Checkpoint160 storage result)
+    {
+        assembly {
+            mstore(0, self.slot)
+            result.slot := add(keccak256(0, 0x20), pos)
+        }
+    }
+}
 
 /**
  * @dev Interface of ERC721 token receiver.
@@ -33,11 +180,15 @@ interface ERC721A__IERC721Receiver {
  * - An owner cannot have more than 2**64 - 1 (max value of uint64) of supply.
  * - The maximum token ID cannot exceed 2**256 - 1 (max value of uint256).
  */
-contract ERC721ANew is IERC721A {
+contract ERC721AModified is IERC721A {
     // Bypass for a `--via-ir` bug (https://github.com/chiru-labs/ERC721A/pull/364).
     struct TokenApprovalRef {
         address value;
     }
+
+    using Checkpoints for Checkpoints.Trace160;
+
+    Checkpoints.Trace160 private _sequentialOwnership;
 
     // =============================================================
     //                           CONSTANTS
@@ -406,6 +557,15 @@ contract ERC721ANew is IERC721A {
                     // (i.e. `ownership.addr == address(0) && ownership.burned == false`)
                     // Hence, `tokenId` will not underflow.
                     //
+                    //binary search for ERC2309 minted tokens more efficient than sequential search
+                    if (tokenId < _totalConsecutiveSupply()) {
+                        return
+                            uint256(
+                                _sequentialOwnership.lowerLookup(
+                                    uint96(tokenId)
+                                ) | _BITMASK_NEXT_INITIALIZED
+                            );
+                    }
                     // We can directly compare the packed value.
                     // If the address is zero, packed will be zero.
                     for (;;) {
@@ -423,6 +583,12 @@ contract ERC721ANew is IERC721A {
             }
         }
         _revert(OwnerQueryForNonexistentToken.selector);
+    }
+
+    function _totalConsecutiveSupply() private view returns (uint96) {
+        (bool exists, uint96 latestId, ) = _sequentialOwnership
+            .latestCheckpoint();
+        return exists ? latestId + 1 : 0;
     }
 
     /**
@@ -875,23 +1041,25 @@ contract ERC721ANew is IERC721A {
             if (toMasked == 0) _revert(MintToZeroAddress.selector);
 
             uint256 end = startTokenId + quantity;
-            uint256 tokenId = startTokenId;
-
-            do {
-                assembly {
-                    // Emit the `Transfer` event.
-                    log4(
-                        0, // Start of data (0, since no data).
-                        0, // End of data (0, since no data).
-                        _TRANSFER_EVENT_SIGNATURE, // Signature.
-                        0, // `address(0)`.
-                        toMasked, // `to`.
-                        tokenId // `tokenId`.
-                    )
-                }
-                // The `!=` check ensures that large values of `quantity`
-                // that overflows uint256 will make the loop run out of gas.
-            } while (++tokenId != end);
+            // uint256 tokenId = startTokenId;
+            /// emit consecutive
+            emit ConsecutiveTransfer(startTokenId, end - 1, address(0), to);
+            //------omited
+            // do {
+            //     assembly {
+            //         // Emit the `Transfer` event.
+            //         log4(
+            //             0, // Start of data (0, since no data).
+            //             0, // End of data (0, since no data).
+            //             _TRANSFER_EVENT_SIGNATURE, // Signature.
+            //             0, // `address(0)`.
+            //             toMasked, // `to`.
+            //             tokenId // `tokenId`.
+            //         )
+            //     }
+            //     // The `!=` check ensures that large values of `quantity`
+            //     // that overflows uint256 will make the loop run out of gas.
+            // } while (++tokenId != end);
 
             _currentIndex = end;
         }
@@ -944,12 +1112,16 @@ contract ERC721ANew is IERC721A {
             // - `startTimestamp` to the timestamp of minting.
             // - `burned` to `false`.
             // - `nextInitialized` to `quantity == 1`.
-            _packedOwnerships[startTokenId] = _packOwnershipData(
-                to,
-                _nextInitializedFlag(quantity) |
-                    _nextExtraData(address(0), to, 0)
-            );
-
+            // --------------Omited
+            // _packedOwnerships[startTokenId] = _packOwnershipData(
+            //     to,
+            //     _nextInitializedFlag(quantity) |
+            //         _nextExtraData(address(0), to, 0)
+            // );
+            //
+            uint96 last = uint96(startTokenId + quantity - 1);
+            _sequentialOwnership.push(last, uint160(to));
+            //
             emit ConsecutiveTransfer(
                 startTokenId,
                 startTokenId + quantity - 1,
